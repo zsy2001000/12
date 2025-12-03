@@ -1,0 +1,229 @@
+%% 公路无人机巡检 3D 可视化 (集成固定点、去重优化与悬停高度)
+% 功能：
+%   1. 读取 GIS 数据生成 3D 地形。
+%   2. 读取固定巡检点 (严格边缘)。
+%   3. 执行 DIPH 算法生成补充巡检点。
+%   4. 执行"去重取优"逻辑。
+%   5. 在 3D 场景中绘制：
+%      - 地形与中心线
+%      - 原始点 (固定/补充)与剔除点 (灰色叉)
+%      - 最终路径 (红线 + 蓝点)
+%      - 有效悬停高度区间 (仅针对最终保留点)
+
+clear; clc; close all;
+
+%% ========================================================================
+%  Step 0: 参数与数据准备
+% ========================================================================
+GIS_File = 'gis.csv';
+Fixed_Point_File = 'fixed_inspection_points.csv';
+Hover_Data_File = 'g_range_data.mat';
+
+% 算法参数
+Num_Subsections = 50; 
+Threshold_Coeff = 0.2; % 优化阈值
+
+fprintf('正在初始化 3D 环境...\n');
+
+% 1. 检查文件
+if ~isfile(GIS_File), error('缺少 gis.csv'); end
+if ~isfile(Fixed_Point_File), error('缺少固定点文件，请先运行 gissimulation_final.m'); end
+if ~isfile(Hover_Data_File)
+    error('缺少 g_range_data.mat！请先运行 Li.m 计算高度范围。');
+else
+    load(Hover_Data_File); % 加载 g_min, g_max
+    fprintf('已加载悬停高度参数: [%.2f m, %.2f m]\n', g_min, g_max);
+end
+
+% 2. 读取数据
+data_road = readtable(GIS_File);
+rx = data_road.x; ry = data_road.y; rz = data_road.z;
+[rx_sorted, sort_idx] = sort(rx);
+ry_sorted = ry(sort_idx); rz_sorted = rz(sort_idx);
+
+data_fixed = readtable(Fixed_Point_File);
+Pts_Fixed = [data_fixed.x, data_fixed.y, data_fixed.z];
+Type_Fixed = ones(size(Pts_Fixed,1), 1) * 1;
+
+% 3. 生成补充点 (DIPH 3D版)
+% 这里需要带上 Z 轴信息
+x_min = min(rx); x_max = max(rx);
+x_edges = linspace(x_min, x_max, Num_Subsections + 1);
+Pts_Supp = [];
+Center_Line_3D = [];
+
+for k = 1:Num_Subsections
+    idx = (rx_sorted >= x_edges(k)) & (rx_sorted < x_edges(k+1));
+    if ~any(idx), continue; end
+    px = rx_sorted(idx); py = ry_sorted(idx); pz = rz_sorted(idx);
+    
+    % 中心点 (3D)
+    cx = mean(px); cy = mean(py); cz = mean(pz);
+    Center_Line_3D = [Center_Line_3D; cx, cy, cz];
+    
+    % 找最远点
+    idx_up = py > cy;
+    if any(idx_up)
+        d = sqrt((px(idx_up)-cx).^2 + (py(idx_up)-cy).^2);
+        [~, mid] = max(d);
+        tmp_idx = find(idx_up); real_id = tmp_idx(mid);
+        Pts_Supp = [Pts_Supp; px(real_id), py(real_id), pz(real_id)];
+    end
+    idx_down = py <= cy;
+    if any(idx_down)
+        d = sqrt((px(idx_down)-cx).^2 + (py(idx_down)-cy).^2);
+        [~, mid] = max(d);
+        tmp_idx = find(idx_down); real_id = tmp_idx(mid);
+        Pts_Supp = [Pts_Supp; px(real_id), py(real_id), pz(real_id)];
+    end
+end
+Type_Supp = ones(size(Pts_Supp,1), 1) * 2;
+
+%% ========================================================================
+%  Step 1: 路径优化 (去重取优)
+% ========================================================================
+fprintf('正在执行 3D 路径优化...\n');
+
+% 合并并排序
+All_Pts = [Pts_Fixed; Pts_Supp];
+All_Types = [Type_Fixed; Type_Supp];
+[~, sort_order] = sort(All_Pts(:,1));
+All_Pts = All_Pts(sort_order, :);
+All_Types = All_Types(sort_order);
+
+% 计算阈值
+diffs = diff(All_Pts(:,1:2)); % 距离判断主要基于水平距离
+dists = sqrt(sum(diffs.^2, 2));
+Avg_Dist = mean(dists);
+Limit_Dist = Avg_Dist * Threshold_Coeff;
+
+Final_Path = [];      % 最终保留点 [x, y, z, type]
+Discarded_Points = []; % 被剔除点 [x, y, z]
+
+i = 1;
+while i <= size(All_Pts, 1)
+    Current_P = All_Pts(i, :);
+    Current_Type = All_Types(i);
+    
+    if i == size(All_Pts, 1)
+        Final_Path = [Final_Path; Current_P, Current_Type];
+        break;
+    end
+    
+    Next_P = All_Pts(i+1, :);
+    % 计算水平距离
+    dist_next = sqrt((Current_P(1)-Next_P(1))^2 + (Current_P(2)-Next_P(2))^2);
+    
+    if dist_next < Limit_Dist
+        % 冲突：二选一
+        if i+2 <= size(All_Pts, 1)
+            Target_P = All_Pts(i+2, :);
+        else
+            Target_P = Current_P;
+        end
+        
+        % 比较 3D 距离
+        d1 = norm(Current_P - Target_P);
+        d2 = norm(Next_P - Target_P);
+        
+        if d1 < d2
+            Final_Path = [Final_Path; Current_P, Current_Type];
+            Discarded_Points = [Discarded_Points; Next_P];
+            i = i + 2;
+        else
+            Discarded_Points = [Discarded_Points; Current_P];
+            i = i + 1;
+        end
+    else
+        Final_Path = [Final_Path; Current_P, Current_Type];
+        i = i + 1;
+    end
+end
+
+fprintf('优化完成。最终保留 %d 个巡检点 (剔除 %d 个)。\n', size(Final_Path,1), size(Discarded_Points,1));
+
+%% ========================================================================
+%  Step 2: 3D 绘图
+% ========================================================================
+fprintf('正在绘制 3D 场景...\n');
+figure('Name', '3D Inspection Path (Optimized)', 'Color', 'w', 'Position', [50, 50, 1200, 800]);
+hold on; grid on; axis equal;
+
+% 1. 地形背景 (淡绿色)
+step = 5; 
+scatter3(rx_sorted(1:step:end), ry_sorted(1:step:end), rz_sorted(1:step:end), ...
+         2, [0.6 0.8 0.6], '.', 'HandleVisibility', 'off');
+
+% 2. 中心线 (深灰虚线)
+if ~isempty(Center_Line_3D)
+    plot3(Center_Line_3D(:,1), Center_Line_3D(:,2), Center_Line_3D(:,3), ...
+          '--', 'Color', [0.3 0.3 0.3], 'LineWidth', 1.5, 'DisplayName', 'Center Line');
+end
+
+% 3. 原始点展示 (作为底图)
+% 固定点 (黑方块)
+if ~isempty(Pts_Fixed)
+    scatter3(Pts_Fixed(:,1), Pts_Fixed(:,2), Pts_Fixed(:,3), ...
+             30, 'k', 's', 'DisplayName', 'Fixed (Original)');
+end
+% 补充点 (红空心圆)
+if ~isempty(Pts_Supp)
+    scatter3(Pts_Supp(:,1), Pts_Supp(:,2), Pts_Supp(:,3), ...
+             30, 'r', 'o', 'DisplayName', 'Supp (Original)');
+end
+
+% 4. 被剔除的点 (灰色立体叉号)
+if ~isempty(Discarded_Points)
+    scatter3(Discarded_Points(:,1), Discarded_Points(:,2), Discarded_Points(:,3), ...
+             60, [0.5 0.5 0.5], 'x', 'LineWidth', 2, 'DisplayName', 'Discarded');
+end
+
+% 5. 最终路径 (红线 + 蓝实心点)
+if ~isempty(Final_Path)
+    % 路径连线 (Z字形)
+    plot3(Final_Path(:,1), Final_Path(:,2), Final_Path(:,3), ...
+          'r-', 'LineWidth', 2, 'DisplayName', 'Final Path');
+    
+    % 保留点标记 (蓝色实心)
+    scatter3(Final_Path(:,1), Final_Path(:,2), Final_Path(:,3), ...
+             50, 'b', 'filled', 'o', 'DisplayName', 'Selected Point');
+end
+
+% 6. [核心] 绘制悬停高度区间 (仅在最终保留点上方)
+% 逻辑：从 Z 到 Z+g_max 的蓝色垂直线，以及 g_min 处的标记
+fprintf('正在生成悬停高度可视化 (g: %.2f - %.2f)...\n', g_min, g_max);
+
+for i = 1:size(Final_Path, 1)
+    pt = Final_Path(i, :);
+    px = pt(1); py = pt(2); pz = pt(3);
+    
+    h_start = pz + g_min;
+    h_end   = pz + g_max;
+    
+    % 绘制垂直线段 (代表有效区间)
+    % 仅第一条加图例
+    if i == 1
+        plot3([px, px], [py, py], [h_start, h_end], ...
+              'b-', 'LineWidth', 2, 'DisplayName', 'Hover Range');
+    else
+        plot3([px, px], [py, py], [h_start, h_end], ...
+              'b-', 'LineWidth', 2, 'HandleVisibility', 'off');
+    end
+    
+    % 可选：绘制一条细虚线连接地面点和悬停区间起点 (增加空间感)
+    plot3([px, px], [py, py], [pz, h_start], ...
+          ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 0.5, 'HandleVisibility', 'off');
+      
+    % 在区间上下端画小横杠或点
+    plot3(px, py, h_start, 'b_', 'MarkerSize', 4, 'HandleVisibility', 'off');
+    plot3(px, py, h_end,   'b_', 'MarkerSize', 4, 'HandleVisibility', 'off');
+end
+
+% 视图设置
+title('3D Inspection Path: Optimized with Ho ver Ranges');
+xlabel('Longitude (x)'); ylabel('Latitude (y)'); zlabel('Altitude (z)');
+legend('Location', 'northeast');
+view(-30, 30); 
+rotate3d on;
+
+fprintf('3D 绘图完成。图中蓝色垂直线表示最终巡检点的有效悬停高度。\n');
